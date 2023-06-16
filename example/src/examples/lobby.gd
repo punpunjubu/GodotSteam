@@ -11,6 +11,19 @@ var LOBBY_VOTE_KICK: bool = false
 var LOBBY_MAX_MEMBERS: int = 10
 enum LOBBY_AVAILABILITY {PRIVATE, FRIENDS, PUBLIC, INVISIBLE}
 
+#VOIP#
+export var recording: bool = false
+export(float, 0.0, 1.0) var input_threshold: = 0.005
+export var custom_voice_audio_stream_player: NodePath
+
+var _mic: VoiceMic #from src/voice-mic.gd
+var _voice
+var _effect_capture: AudioEffectCapture
+var _playback: AudioStreamGeneratorPlayback
+var _receive_buffer := PoolRealArray()
+var _prev_frame_recording = false
+#################################################
+
 # Set up some signals
 signal back_to_main
 
@@ -36,6 +49,9 @@ func _process(_delta: float) -> void:
 	# Get packets if lobby is joined
 	if LOBBY_ID > 0:
 		_read_P2P_Packet()
+		_process_mic()
+		if _playback != null:
+			_process_voice()
 
 
 #################################################
@@ -186,6 +202,9 @@ func _read_P2P_Packet() -> void:
 		# Make the packet data readable
 		var READABLE: Dictionary = bytes2var(PACKET_CODE)
 		# Print the packet to output
+		if READABLE['message'] == "voice":
+			_speak(READABLE['voice_data'])
+			return
 		$Output.append_bbcode("[STEAM] Packet from "+str(PACKET_SENDER)+": "+str(READABLE)+"\n")
 		# Append logic here to deal with packet data
 		if READABLE['message'] == "start":
@@ -545,3 +564,98 @@ func _on_Back_pressed() -> void:
 		_leave_Lobby()
 	# Head back to the main menu
 	emit_signal("back_to_main")
+	
+#################################################
+################VOIP
+#################################################
+
+func _create_mic():
+	_mic = VoiceMic.new()
+	add_child(_mic)
+	var record_bus_idx := AudioServer.get_bus_index(_mic.bus)
+	_effect_capture = AudioServer.get_bus_effect(record_bus_idx, 0)
+	
+
+func _process_mic():
+	if recording:
+		if _effect_capture == null:
+			_create_mic()
+		if _prev_frame_recording == false:
+			_effect_capture.clear_buffer()
+		var stereo_data: PoolVector2Array = _effect_capture.get_buffer(_effect_capture.get_frames_available())
+		if stereo_data.size() > 0:
+			var data = PoolRealArray()
+			data.resize(stereo_data.size())
+			var max_value := 0.0
+			for i in range(stereo_data.size()):
+				#avg sound
+				var value := (stereo_data[i].x + stereo_data[i].y) / 2.0
+				#update and get max value from 2 values
+				max_value = max(value, max_value)
+				#transform value to one value
+				data[i] = value
+			#if mic capture voice below threshold -> clip it and won't send data to others
+#			print("max_value ", max_value)
+			if max_value < input_threshold:
+				return
+			send_data(data)
+	_prev_frame_recording = recording
+	
+
+func _process_voice():
+#check if voice available or not
+	if _playback.get_frames_available() < 1:
+		#not available so return
+		return
+
+	for i in range(min(_playback.get_frames_available(), _receive_buffer.size())):
+		_playback.push_frame(Vector2(_receive_buffer[0], _receive_buffer[0]))
+		#optimize -> read element 0 and delete it
+		_receive_buffer.remove(0)
+		
+func send_data(data: PoolRealArray):
+	var voicedict = {"message": 'voice', "voice_data": data, "from":global.STEAM_ID }
+	_send_P2P_Packet(0, voicedict)
+
+func _create_voice():
+	#check if not empty node -> if empty go read else
+	if !custom_voice_audio_stream_player.is_empty():
+		#if node not empty
+		var player = get_node(custom_voice_audio_stream_player)
+		#check if node not null
+		if player != null:
+			#check if it that type of 3 node
+			if player is AudioStreamPlayer || player is AudioStreamPlayer2D || player is AudioStreamPlayer3D:
+				#variable that notassign value _voice = player
+				_voice = player
+			else:
+				#if not that 3 node above throw error
+				push_error("node:'%s' is not any kind of AudioStreamPlayer!" % custom_voice_audio_stream_player)
+		else:
+			#check if it was delete -> used to have it and it was deleted
+			push_error("node:'%s' does not exist!" % custom_voice_audio_stream_player)
+	#if empty node so create AudioStreamPlayer and add it on nodePath
+	else:
+		_voice = AudioStreamPlayer.new()
+		add_child(_voice)
+
+	#create voice
+	var generator := AudioStreamGenerator.new()
+	#set buffer_lengtth of stream generator 0.1 -> lower length effect to CPU
+	generator.buffer_length = 0.1
+	#set stream of AudioStreamPlayer to AudioStreamGenerator
+	_voice.stream = generator
+	#AudioStreamPlayback equal _voice.get_stream_playback()
+	_playback = _voice.get_stream_playback()
+	#play AudioStreamPlayer with voice data of AudioStreamGeneratorPlayback (_playback)
+	_voice.play()
+	
+func _speak(sample_data: PoolRealArray):
+	if _playback == null:
+		_create_voice()
+	_receive_buffer.append_array(sample_data)
+
+
+func _on_Voice_toggled(button_pressed):
+	print("button_pressed ", button_pressed)
+	recording = !recording
